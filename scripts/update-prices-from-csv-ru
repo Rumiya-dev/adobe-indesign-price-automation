@@ -1,0 +1,794 @@
+/**
+ * ============================================================================
+ *  UpdatePrices_v9_DUPLICATES_AND_ABOVE.jsx
+ * ============================================================================
+ *
+ *  ОСНОВА: v8_SMART
+ *
+ *  НОВОЕ В v9:
+ *    1. Обработка ДУБЛИКАТОВ кодов в одном фрейме
+ *       (если код CHIXXX встречается 2+ раз — обновятся ВСЕ его цены)
+ *
+ *    2. ЧЕКБОКС "Искать цену над кодами"
+ *       — для карточек типа Color Illuminate, где одна цена на много кодов
+ *       — ВКЛЮЧАЕТСЯ ТОЛЬКО если справа от кода цена не найдена
+ *       — защищён ограничением переносов строк (до 10)
+ *       — защита AEI работает и тут
+ *
+ *  СОХРАНЕНО ИЗ v8:
+ *    - Защита от AEI (чекбокс)
+ *    - Поиск ТОЛЬКО справа для обычных кодов (без Math.abs)
+ *    - netto/brutto авто-выбор
+ *    - Без .filter() (совместимо с ExtendScript)
+ *
+ *  НОВЫЙ АЛГОРИТМ:
+ *    Старый подход (v8) мог обработать только первое вхождение кода
+ *    из-за использования `content.indexOf(code)` внутри цикла.
+ *
+ *    Новый подход (v9):
+ *    1. Найти ВСЕ пары (код, позиция) в тексте фрейма
+ *    2. Для каждой пары спланировать замену (позиция цены + новый текст)
+ *    3. Применить все замены в ОБРАТНОМ порядке позиций,
+ *       чтобы ранние позиции не сдвигались
+ *    4. Дедупликация: если 2 кода указывают на одну цену — берём первую замену
+ *
+ * ============================================================================
+ */
+
+#target indesign
+
+var CONFIG = {
+    csvSeparator:   ";",
+    colKod:         1,
+    colCenaNetto:   3,
+    colCenaBrutto:  4,
+    colCenaPromo:   5,
+    currencySuffix: " zł",
+
+    maxLineDist:    100,     // макс. расстояние "код → цена" в символах (право)
+    maxLineBreaks:  2,       // макс. переносов строк между кодом и ценой (право)
+
+    // Для поиска ЦЕНЫ НАД КОДАМИ — более щедрые лимиты
+    maxUpwardDist:    800,   // макс. расстояние назад от кода
+    maxUpwardBreaks:  10,    // макс. переносов строк назад
+
+    targetPrice:    "auto",
+
+    aeiProtection:  true,
+    aeiCheckDist:   100,
+
+    nettoBruttoWindow: 40,
+
+    // НОВОЕ: включён ли поиск цены над кодами (устанавливается из диалога)
+    searchAbove: false
+};
+
+var IS_WINDOWS = ($.os.indexOf("Windows") !== -1);
+var SELECTED_PRICE_TYPE = "brutto";
+
+// ============================================================================
+// ДИАЛОГ НАСТРОЕК
+// ============================================================================
+function showSettingsDialog() {
+    var dlg = new Window("dialog", "Обновление цен — v9");
+    dlg.orientation = "column";
+    dlg.alignChildren = ["fill", "top"];
+
+    // 1. Файл
+    var filePanel = dlg.add("panel", undefined, "1. Файл с ценами");
+    filePanel.alignChildren = ["fill", "center"];
+    filePanel.margins = [10, 15, 10, 10];
+
+    if (IS_WINDOWS) {
+        filePanel.add("statictext", undefined, "Можно выбрать .xlsx, .xls или .csv");
+    } else {
+        filePanel.add("statictext", undefined, "macOS: только .csv");
+    }
+
+    var fileRow = filePanel.add("group");
+    var filePath = fileRow.add("edittext", undefined, "");
+    filePath.characters = 45;
+    var browseBtn = fileRow.add("button", undefined, "Обзор…");
+
+    var chosenFile = null;
+    browseBtn.onClick = function () {
+        var filter = IS_WINDOWS
+            ? "Excel / CSV:*.xlsx;*.xls;*.csv;*.txt, All:*.*"
+            : "CSV:*.csv;*.txt, All:*.*";
+        var f = File.openDialog("Выберите файл с ценами", filter);
+        if (f) {
+            chosenFile = f;
+            filePath.text = f.fsName;
+        }
+    };
+
+    // 2. Колонка цены
+    var colPanel = dlg.add("panel", undefined, "2. Какую цену подставлять?");
+    colPanel.alignChildren = ["left", "center"];
+    colPanel.margins = [10, 15, 10, 10];
+
+    var rb1 = colPanel.add("radiobutton", undefined, "D — Cena cennikowa netto");
+    var rb2 = colPanel.add("radiobutton", undefined, "E — Cena cennikowa brutto");
+    var rb3 = colPanel.add("radiobutton", undefined, "F — Cena promocyjna netto -35%");
+    rb2.value = true;
+
+    // 3. Разделитель
+    var sepPanel = dlg.add("panel", undefined, "3. Разделитель CSV");
+    sepPanel.alignChildren = ["left", "center"];
+    sepPanel.margins = [10, 15, 10, 10];
+
+    var sepSemi  = sepPanel.add("radiobutton", undefined, "Точка с запятой ( ; )");
+    var sepComma = sepPanel.add("radiobutton", undefined, "Запятая ( , )");
+    sepSemi.value = true;
+
+    // 4. Доп. опции
+    var optPanel = dlg.add("panel", undefined, "4. Дополнительно");
+    optPanel.alignChildren = ["left", "center"];
+    optPanel.margins = [10, 15, 10, 10];
+
+    var aeiCheck = optPanel.add("checkbox", undefined, "Защита от AEI (не менять цены рядом со словом AEI)");
+    aeiCheck.value = true;
+
+    var aboveCheck = optPanel.add("checkbox", undefined, "Искать цену НАД кодами (для карточек с общей ценой)");
+    aboveCheck.value = false;
+
+    var hint1 = optPanel.add("statictext", undefined,
+        "   Включайте, если в карточке ОДНА цена на несколько кодов (пример: Color Illuminate)", {multiline: true});
+    hint1.graphics.foregroundColor = hint1.graphics.newPen(hint1.graphics.PenType.SOLID_COLOR, [0.4, 0.4, 0.4, 1], 1);
+
+    // Кнопки
+    var btnGroup = dlg.add("group");
+    btnGroup.alignment = ["right", "center"];
+    btnGroup.add("button", undefined, "Отмена", {name: "cancel"});
+    btnGroup.add("button", undefined, "Запустить", {name: "ok"});
+
+    if (dlg.show() !== 1) return null;
+    if (!chosenFile) { alert("Файл не выбран.", "Ошибка"); return null; }
+
+    var priceCol = CONFIG.colCenaBrutto;
+    SELECTED_PRICE_TYPE = "brutto";
+
+    if (rb1.value) {
+        priceCol = CONFIG.colCenaNetto;
+        SELECTED_PRICE_TYPE = "netto";
+    }
+    if (rb3.value) {
+        priceCol = CONFIG.colCenaPromo;
+        SELECTED_PRICE_TYPE = "netto";
+    }
+    if (sepComma.value) CONFIG.csvSeparator = ",";
+
+    CONFIG.aeiProtection = aeiCheck.value;
+    CONFIG.searchAbove = aboveCheck.value;
+
+    return { file: chosenFile, priceColumn: priceCol };
+}
+
+// ============================================================================
+// КОНВЕРТАЦИЯ EXCEL → CSV (Windows)
+// ============================================================================
+function convertExcelToCSV(excelFile) {
+    var excelPath = excelFile.fsName;
+    var csvPath = excelPath.replace(/\.(xlsx?|xls)$/i, "_temp_export.csv");
+    var vbsPath = excelPath.replace(/\.(xlsx?|xls)$/i, "_converter.vbs");
+
+    var vbsCode = "";
+    vbsCode += 'On Error Resume Next\r\n';
+    vbsCode += 'Dim xlApp, xlBook\r\n';
+    vbsCode += 'Set xlApp = CreateObject("Excel.Application")\r\n';
+    vbsCode += 'If Err.Number <> 0 Then WScript.Quit 1\r\n';
+    vbsCode += 'End If\r\n';
+    vbsCode += 'xlApp.Visible = False\r\n';
+    vbsCode += 'xlApp.DisplayAlerts = False\r\n';
+    vbsCode += 'Set xlBook = xlApp.Workbooks.Open("' + escapeVBS(excelPath) + '")\r\n';
+    vbsCode += 'If Err.Number <> 0 Then\r\n';
+    vbsCode += '    xlApp.Quit\r\n';
+    vbsCode += '    WScript.Quit 1\r\n';
+    vbsCode += 'End If\r\n';
+    vbsCode += 'xlBook.SaveAs "' + escapeVBS(csvPath) + '", 6\r\n';
+    vbsCode += 'xlBook.Close False\r\n';
+    vbsCode += 'xlApp.Quit\r\n';
+
+    var vbsFile = new File(vbsPath);
+    vbsFile.encoding = "UTF-8";
+    vbsFile.open("w");
+    vbsFile.write(vbsCode);
+    vbsFile.close();
+
+    var cmd = 'cscript //NoLogo "' + vbsPath + '"';
+    try {
+        app.system(cmd);
+    } catch (e) {
+        try {
+            var wsh = new ActiveXObject("WScript.Shell");
+            wsh.Run(cmd, 0, true);
+        } catch (e2) {
+            cleanup(vbsFile, null);
+            return null;
+        }
+    }
+
+    $.sleep(2000);
+    var csvFile = new File(csvPath);
+    var attempts = 0;
+    while (!csvFile.exists && attempts < 10) {
+        $.sleep(1000);
+        attempts++;
+    }
+
+    if (!csvFile.exists) {
+        cleanup(vbsFile, null);
+        return null;
+    }
+
+    cleanup(vbsFile, null);
+    CONFIG.csvSeparator = detectSeparator(csvFile);
+    return csvFile;
+}
+
+function escapeVBS(path) { return path.replace(/"/g, '""'); }
+
+function detectSeparator(csvFile) {
+    csvFile.open("r");
+    csvFile.encoding = "UTF-8";
+    var firstLine = csvFile.readln();
+    csvFile.close();
+    if (!firstLine) return ";";
+    var semicolons = (firstLine.match(/;/g) || []).length;
+    var commas     = (firstLine.match(/,/g) || []).length;
+    return (semicolons >= commas) ? ";" : ",";
+}
+
+function cleanup(vbsFile, csvFile) {
+    try { if (vbsFile && vbsFile.exists) vbsFile.remove(); } catch (e) {}
+    try { if (csvFile && csvFile.exists) csvFile.remove(); } catch (e) {}
+}
+
+// ============================================================================
+// ЧТЕНИЕ CSV
+// ============================================================================
+function readCSV(csvFile, priceColumn) {
+    var lookup = {};
+    var lineCount = 0;
+
+    csvFile.open("r");
+    csvFile.encoding = "UTF-8";
+
+    while (!csvFile.eof) {
+        var line = csvFile.readln();
+        lineCount++;
+
+        if (lineCount === 1) continue;
+        if (!line || line.replace(/\s/g, "") === "") continue;
+
+        var cols = parseCSVLine(line, CONFIG.csvSeparator);
+        var code  = trimStr(cols[CONFIG.colKod]  || "");
+        var price = trimStr(cols[priceColumn]     || "");
+        code  = stripQuotes(code);
+        price = stripQuotes(price);
+
+        if (code !== "") lookup[code] = price;
+    }
+
+    csvFile.close();
+    return lookup;
+}
+
+function parseCSVLine(line, sep) {
+    var result = [];
+    var current = "";
+    var inQuotes = false;
+
+    for (var i = 0; i < line.length; i++) {
+        var ch = line.charAt(i);
+        if (inQuotes) {
+            if (ch === '"') {
+                if (i + 1 < line.length && line.charAt(i + 1) === '"') {
+                    current += '"';
+                    i++;
+                } else {
+                    inQuotes = false;
+                }
+            } else {
+                current += ch;
+            }
+        } else {
+            if (ch === '"') {
+                inQuotes = true;
+            } else if (ch === sep) {
+                result.push(current);
+                current = "";
+            } else {
+                current += ch;
+            }
+        }
+    }
+    result.push(current);
+    return result;
+}
+
+// ============================================================================
+// ВСПОМОГАТЕЛЬНЫЕ
+// ============================================================================
+function getAllTextFrames(doc) {
+    var frames = [];
+    for (var s = 0; s < doc.spreads.length; s++) {
+        var items = doc.spreads[s].allPageItems;
+        for (var i = 0; i < items.length; i++) {
+            if (items[i] instanceof TextFrame) frames.push(items[i]);
+        }
+    }
+    return frames;
+}
+
+function formatPrice(raw) {
+    var cleaned = raw.replace(/[^\d\.,\-]/g, "");
+    cleaned = cleaned.replace(".", ",");
+    if (cleaned.indexOf(",") === -1) {
+        cleaned += ",00";
+    } else {
+        var parts = cleaned.split(",");
+        var dec = parts[1] || "00";
+        if (dec.length === 1) dec += "0";
+        if (dec.length > 2)  dec = dec.substring(0, 2);
+        cleaned = parts[0] + "," + dec;
+    }
+    return cleaned + CONFIG.currencySuffix;
+}
+
+function trimStr(s)      { return s.replace(/^\s+|\s+$/g, ""); }
+function stripQuotes(s)  { return s.replace(/^["']|["']$/g, ""); }
+function isAlphaNum(ch)  { return /[a-zA-Z0-9]/.test(ch); }
+
+function countLineBreaks(content, from, to) {
+    if (to <= from) return 0;
+    var substr = content.substring(from, to);
+    var matches = substr.match(/\r\n|\r|\n/g);
+    return matches ? matches.length : 0;
+}
+
+// ============================================================================
+// ОПРЕДЕЛЕНИЕ netto/brutto (из v8)
+// ============================================================================
+function detectPriceType(content, pricePos, priceLen) {
+    var W = CONFIG.nettoBruttoWindow;
+    var start = Math.max(0, pricePos - W);
+    var end = Math.min(content.length, pricePos + priceLen + W);
+    var surroundingText = content.substring(start, end).toLowerCase();
+
+    var priceEndInWindow = (pricePos + priceLen) - start;
+    var nettoIdx = surroundingText.indexOf("netto");
+    var bruttoIdx = surroundingText.indexOf("brutto");
+
+    if (nettoIdx === -1 && bruttoIdx === -1) return "unknown";
+    if (nettoIdx === -1) return "brutto";
+    if (bruttoIdx === -1) return "netto";
+
+    var distNetto = (nettoIdx >= priceEndInWindow) ? (nettoIdx - priceEndInWindow) : 9999;
+    var distBrutto = (bruttoIdx >= priceEndInWindow) ? (bruttoIdx - priceEndInWindow) : 9999;
+
+    if (distNetto === 9999 && distBrutto === 9999) {
+        return (priceEndInWindow - nettoIdx) < (priceEndInWindow - bruttoIdx) ? "netto" : "brutto";
+    }
+    return distNetto < distBrutto ? "netto" : "brutto";
+}
+
+// ============================================================================
+// НАХОЖДЕНИЕ ВСЕХ ЦЕН В ТЕКСТЕ
+// ============================================================================
+function findAllPrices(content) {
+    var pricePattern = new RegExp("(\\d+[\\.,]\\d{2})\\s*zł", "gi");
+    var prices = [];
+    var match;
+    pricePattern.lastIndex = 0;
+    while ((match = pricePattern.exec(content)) !== null) {
+        prices.push({
+            fullMatch: match[0],
+            position: match.index,
+            length: match[0].length
+        });
+    }
+    return prices;
+}
+
+// ============================================================================
+// ПОИСК ВСЕХ ВХОЖДЕНИЙ КАЖДОГО КОДА (с проверкой границ)
+// v8 находил только ПЕРВОЕ вхождение → баг с дубликатами
+// v9 находит ВСЕ
+// ============================================================================
+function findAllCodeOccurrences(content, sortedCodes) {
+    var occurrences = [];
+
+    for (var i = 0; i < sortedCodes.length; i++) {
+        var code = sortedCodes[i];
+        var searchFrom = 0;
+
+        while (true) {
+            var idx = content.indexOf(code, searchFrom);
+            if (idx === -1) break;
+
+            var charBefore = (idx > 0) ? content.charAt(idx - 1) : " ";
+            var charAfter  = (idx + code.length < content.length)
+                             ? content.charAt(idx + code.length)
+                             : " ";
+            var boundaryBefore = (idx === 0) || !isAlphaNum(charBefore);
+            var boundaryAfter  = (idx + code.length >= content.length) || !isAlphaNum(charAfter);
+
+            if (boundaryBefore && boundaryAfter) {
+                occurrences.push({
+                    code: code,
+                    position: idx,
+                    length: code.length
+                });
+            }
+
+            searchFrom = idx + code.length;
+        }
+    }
+    return occurrences;
+}
+
+// ============================================================================
+// ВЫБОР ЛУЧШЕЙ ЦЕНЫ ИЗ КАНДИДАТОВ
+// ============================================================================
+function pickBestFromCandidates(candidates, targetType) {
+    if (candidates.length === 0) return null;
+    var wanted = (targetType === "auto") ? SELECTED_PRICE_TYPE : targetType;
+
+    // 1. Ищем точно нужный тип (netto или brutto) с минимальной дистанцией
+    var best = null;
+    for (var j = 0; j < candidates.length; j++) {
+        if (candidates[j].type === wanted) {
+            if (!best || candidates[j].distance < best.distance) best = candidates[j];
+        }
+    }
+    if (best) return best;
+
+    // 2. Берём ближайшую любую
+    for (var k = 0; k < candidates.length; k++) {
+        if (!best || candidates[k].distance < best.distance) best = candidates[k];
+    }
+    return best;
+}
+
+// ============================================================================
+// ПОИСК ЦЕНЫ СПРАВА ОТ КОДА (основной режим)
+// ============================================================================
+function findPriceRightOf(content, codePos, codeLen, allPrices) {
+    var codeEnd = codePos + codeLen;
+    var candidates = [];
+
+    for (var i = 0; i < allPrices.length; i++) {
+        var p = allPrices[i];
+        if (p.position <= codeEnd) continue;  // пропускаем слева
+        var dist = p.position - codeEnd;
+        if (dist > CONFIG.maxLineDist) continue;
+        var lb = countLineBreaks(content, codeEnd, p.position);
+        if (lb > CONFIG.maxLineBreaks) continue;
+
+        candidates.push({
+            position: p.position,
+            length: p.length,
+            fullMatch: p.fullMatch,
+            distance: dist,
+            lineBreaks: lb,
+            type: detectPriceType(content, p.position, p.length)
+        });
+    }
+    return pickBestFromCandidates(candidates, CONFIG.targetPrice);
+}
+
+// ============================================================================
+// ПОИСК ЦЕНЫ НАД (ПЕРЕД) КОДОМ — новый режим v9
+// ============================================================================
+function findPriceAbove(content, codePos, codeLen, allPrices) {
+    var candidates = [];
+
+    for (var i = 0; i < allPrices.length; i++) {
+        var p = allPrices[i];
+        if (p.position >= codePos) continue;  // только слева/сверху
+        var priceEnd = p.position + p.length;
+        var dist = codePos - priceEnd;  // дистанция от конца цены до начала кода
+        if (dist < 0) continue;
+        if (dist > CONFIG.maxUpwardDist) continue;
+        var lb = countLineBreaks(content, priceEnd, codePos);
+        if (lb > CONFIG.maxUpwardBreaks) continue;
+
+        candidates.push({
+            position: p.position,
+            length: p.length,
+            fullMatch: p.fullMatch,
+            distance: dist,
+            lineBreaks: lb,
+            type: detectPriceType(content, p.position, p.length)
+        });
+    }
+    return pickBestFromCandidates(candidates, CONFIG.targetPrice);
+}
+
+// ============================================================================
+// ПРОВЕРКА AEI рядом с ценой
+// ============================================================================
+function isNearAEI(content, pricePos) {
+    if (!CONFIG.aeiProtection) return false;
+    var checkStart = Math.max(0, pricePos - CONFIG.aeiCheckDist);
+    var checkEnd = Math.min(content.length, pricePos + CONFIG.aeiCheckDist);
+    var surroundingText = content.substring(checkStart, checkEnd);
+    return surroundingText.indexOf("AEI") !== -1;
+}
+
+// ============================================================================
+// ПЛАНИРОВАНИЕ ВСЕХ ЗАМЕН ДЛЯ ФРЕЙМА
+// Возвращает массив {priceStart, priceEnd, newText, code, method}
+// с ДЕДУПЛИКАЦИЕЙ по позиции цены
+// ============================================================================
+function planReplacements(content, occurrences, priceLookup, stats) {
+    var allPrices = findAllPrices(content);
+    if (allPrices.length === 0) return [];
+
+    var plans = [];
+    var usedPricePositions = {}; // для дедупликации
+
+    for (var i = 0; i < occurrences.length; i++) {
+        var occ = occurrences[i];
+        var newPrice = priceLookup[occ.code];
+        if (!newPrice) continue;
+        var formattedPrice = formatPrice(newPrice);
+
+        // 1. Пытаемся найти справа
+        var target = findPriceRightOf(content, occ.position, occ.length, allPrices);
+        var method = "right";
+
+        // 2. Если не нашли и включена опция — ищем над кодом
+        if (!target && CONFIG.searchAbove) {
+            target = findPriceAbove(content, occ.position, occ.length, allPrices);
+            method = "above";
+        }
+
+        if (!target) continue;  // цена не найдена — пропускаем
+
+        // 3. Защита AEI
+        if (isNearAEI(content, target.position)) {
+            stats.skippedAEI++;
+            continue;
+        }
+
+        // 4. Дедупликация: если эта цена уже запланирована к замене — пропускаем
+        var key = target.position + ":" + target.length;
+        if (usedPricePositions[key]) {
+            stats.duplicatesSkipped++;
+            continue;
+        }
+        usedPricePositions[key] = true;
+
+        plans.push({
+            priceStart: target.position,
+            priceEnd: target.position + target.length,
+            newText: formattedPrice,
+            code: occ.code,
+            method: method
+        });
+    }
+    return plans;
+}
+
+// ============================================================================
+// ПРИМЕНЕНИЕ ВСЕХ ПЛАНОВ К ТЕКСТУ (в обратном порядке)
+// ============================================================================
+function applyPlans(content, plans) {
+    if (plans.length === 0) return content;
+
+    // Сортируем по priceStart ПО УБЫВАНИЮ, чтобы ранние позиции не сдвигались
+    plans.sort(function(a, b) { return b.priceStart - a.priceStart; });
+
+    var result = content;
+    for (var i = 0; i < plans.length; i++) {
+        var p = plans[i];
+        result = result.substring(0, p.priceStart) + p.newText + result.substring(p.priceEnd);
+    }
+    return result;
+}
+
+// ============================================================================
+// ОСНОВНАЯ ОБРАБОТКА
+// ============================================================================
+function processDocument(doc, priceLookup) {
+    var report = {
+        updated: 0,
+        replacements: 0,     // сколько отдельных цен заменено
+        aboveUsed: 0,        // сколько раз сработал режим "над кодом"
+        notFoundInDoc: [],
+        errors: [],
+        skippedAEI: 0,
+        duplicatesSkipped: 0
+    };
+
+    var csvCodeSeen = {};
+    for (var k in priceLookup) {
+        if (priceLookup.hasOwnProperty(k)) csvCodeSeen[k] = false;
+    }
+
+    var sortedCodes = [];
+    for (var code in priceLookup) {
+        if (priceLookup.hasOwnProperty(code)) sortedCodes.push(code);
+    }
+    sortedCodes.sort(function(a, b) { return b.length - a.length; });
+
+    var allFrames = getAllTextFrames(doc);
+
+    for (var i = 0; i < allFrames.length; i++) {
+        var frame = allFrames[i];
+        var content = "";
+        try { content = frame.contents; } catch (e) { continue; }
+        if (!content || content === "") continue;
+
+        // Находим ВСЕ вхождения ВСЕХ кодов (с границами)
+        var occurrences = findAllCodeOccurrences(content, sortedCodes);
+        if (occurrences.length === 0) continue;
+
+        // Отмечаем найденные коды
+        for (var o = 0; o < occurrences.length; o++) {
+            csvCodeSeen[occurrences[o].code] = true;
+        }
+
+        // Планируем замены
+        var plans = planReplacements(content, occurrences, priceLookup, report);
+        if (plans.length === 0) continue;
+
+        // Считаем методы
+        for (var pp = 0; pp < plans.length; pp++) {
+            if (plans[pp].method === "above") report.aboveUsed++;
+        }
+
+        // Применяем
+        var newContent = applyPlans(content, plans);
+
+        if (newContent !== content) {
+            try {
+                frame.contents = newContent;
+                report.updated++;
+                report.replacements += plans.length;
+            } catch (e) {
+                report.errors.push("Ошибка записи фрейма: " + e.message);
+            }
+        }
+    }
+
+    for (var c2 in csvCodeSeen) {
+        if (csvCodeSeen.hasOwnProperty(c2) && !csvCodeSeen[c2]) {
+            report.notFoundInDoc.push(c2);
+        }
+    }
+    return report;
+}
+
+// ============================================================================
+// ОТЧЁТ
+// ============================================================================
+function showReport(report, totalCsvRecords) {
+    var msg = "=============================\r\n         ОТЧЁТ (v9)\r\n=============================\r\n\r\n";
+    msg += "Записей в файле:         " + totalCsvRecords + "\r\n";
+    msg += "Фреймов обновлено:       " + report.updated + "\r\n";
+    msg += "Всего цен заменено:      " + report.replacements + "\r\n";
+    msg += "Из них 'цена над кодом': " + report.aboveUsed + "\r\n";
+    msg += "Пропущено (AEI):         " + report.skippedAEI + "\r\n";
+    msg += "Пропущено (дубли цены):  " + report.duplicatesSkipped + "\r\n";
+    msg += "Не найдено в док-те:     " + report.notFoundInDoc.length + "\r\n";
+    msg += "Ошибок:                  " + report.errors.length + "\r\n\r\n";
+
+    if (report.notFoundInDoc.length > 0) {
+        msg += "--- Коды НЕ найдены в документе (" + report.notFoundInDoc.length + ") ---\r\n";
+        for (var i = 0; i < Math.min(report.notFoundInDoc.length, 100); i++) {
+            msg += "  - " + report.notFoundInDoc[i] + "\r\n";
+        }
+        if (report.notFoundInDoc.length > 100) {
+            msg += "  ... и ещё " + (report.notFoundInDoc.length - 100) + "\r\n";
+        }
+        msg += "\r\n";
+    }
+
+    if (report.errors.length > 0) {
+        msg += "--- Ошибки ---\r\n";
+        for (var j = 0; j < report.errors.length; j++) {
+            msg += "  ! " + report.errors[j] + "\r\n";
+        }
+        msg += "\r\n";
+    }
+
+    var desktopPath = Folder.desktop.fsName;
+    var reportPath = desktopPath + "\\price_update_report.txt";
+    var reportFile = new File(reportPath);
+
+    var fileSaved = false;
+    try {
+        reportFile.encoding = "UTF-8";
+        reportFile.open("w");
+        reportFile.write(msg);
+        reportFile.close();
+        fileSaved = true;
+    } catch (e) { fileSaved = false; }
+
+    var summary = "Фреймов обновлено:       " + report.updated + "\n";
+    summary += "Всего цен заменено:      " + report.replacements + "\n";
+    summary += "Из них 'цена над кодом': " + report.aboveUsed + "\n";
+    summary += "Пропущено (AEI):         " + report.skippedAEI + "\n";
+    summary += "Не найдено:              " + report.notFoundInDoc.length + "\n";
+    summary += "Ошибок:                  " + report.errors.length + "\n\n";
+
+    if (fileSaved) {
+        summary += "Отчёт: " + reportPath + "\n\nОткрыть?";
+        if (confirm(summary, false, "Результат")) reportFile.execute();
+    } else {
+        alert(summary, "Результат");
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+function main() {
+    if (app.documents.length === 0) {
+        alert("Нет открытых документов InDesign.", "Ошибка");
+        return;
+    }
+
+    var doc = app.activeDocument;
+    var settings = showSettingsDialog();
+    if (!settings) return;
+
+    var fileName = settings.file.name.toLowerCase();
+    var isExcel  = /\.(xlsx?|xls)$/i.test(fileName);
+    var csvFile  = null;
+    var tempCSV  = false;
+
+    if (isExcel) {
+        if (!IS_WINDOWS) {
+            alert("Прямое чтение Excel доступно только в Windows.", "macOS");
+            return;
+        }
+        var progressWin = new Window("palette", "Конвертация…");
+        progressWin.add("statictext", undefined, "Конвертирую Excel в CSV…");
+        progressWin.show();
+        csvFile = convertExcelToCSV(settings.file);
+        progressWin.close();
+        if (!csvFile) return;
+        tempCSV = true;
+    } else {
+        csvFile = settings.file;
+    }
+
+    var priceLookup = {};
+    try {
+        priceLookup = readCSV(csvFile, settings.priceColumn);
+    } catch (e) {
+        alert("Ошибка чтения:\n" + e.message, "Ошибка");
+        if (tempCSV) cleanup(null, csvFile);
+        return;
+    }
+
+    var totalRecords = 0;
+    for (var k in priceLookup) {
+        if (priceLookup.hasOwnProperty(k)) totalRecords++;
+    }
+
+    if (totalRecords === 0) {
+        alert("Файл не содержит данных.", "Ошибка");
+        if (tempCSV) cleanup(null, csvFile);
+        return;
+    }
+
+    app.doScript(
+        function () {
+            var report = processDocument(doc, priceLookup);
+            showReport(report, totalRecords);
+        },
+        ScriptLanguage.JAVASCRIPT,
+        undefined,
+        UndoModes.ENTIRE_SCRIPT,
+        "Обновление цен v9"
+    );
+
+    if (tempCSV) cleanup(null, csvFile);
+}
+
+main();
