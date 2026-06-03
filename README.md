@@ -29,6 +29,22 @@ The script matches product codes from the document with product codes in the CSV
 This project was created to automate a repetitive catalog update workflow.  
 Instead of manually searching for product codes and changing prices one by one, the script reads updated prices from a CSV file and applies them to the InDesign document.
 
+How It Works
+The user opens an Adobe InDesign document.
+The user runs the script inside Adobe InDesign.
+The script loads a CSV file with product codes and prices.
+The script searches for matching product codes in the document.
+Matching prices are replaced automatically.
+The user can review the updated document.
+Project Status
+
+Portfolio/demo project based on a real workflow automation scenario.
+
+Disclaimer
+
+This repository uses sample data only.
+No real company data, client documents, or commercial price lists are included.
+
 ## Example CSV
 
 ```csv
